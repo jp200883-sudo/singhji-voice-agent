@@ -1,104 +1,84 @@
-"""
-Full-duplex WebSocket Router for Telephony / Live Voice Calls
-Gemini Live API integration
-"""
-
-import json
 import asyncio
+import json
+import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-import websockets
+from groq import AsyncGroq
+import edge_tts
 
+from core.persona_matrix import PersonaMatrix
 from config.settings import settings
-from core.connection_manager import manager
+
+logger = logging.getLogger("singhji-voice-ws")
+router = APIRouter()
+
+# 100% Free Inference Client (Groq Free Tier)
+groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 
 
-router = APIRouter(prefix="/ws", tags=["voice"])
+@router.websocket("/stream/{agent_id}")
+async def voice_stream_endpoint(websocket: WebSocket, agent_id: str):
+    """
+    फुल-डुप्लेक्स लाइव वॉयस पाइपलाइन:
+    WebSocket Audio In -> Groq Whisper (STT) -> Llama-3 (LLM) -> Edge-TTS (Audio Out)
+    """
+    await websocket.accept()
+    logger.info(f"Connected to voice agent session: {agent_id}")
 
-GEMINI_LIVE_URL = (
-    f"wss://generativelanguage.googleapis.com/ws/"
-    f"google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-    f"?key={settings.gemini_api_key}"
-)
+    # एजेंट का पर्सोना और सिस्टम प्रॉम्प्ट लोड करें
+    profile = PersonaMatrix.get_agent_profile(agent_id)
+    system_prompt = PersonaMatrix.build_system_prompt(agent_id)
 
-
-async def gemini_live_session(client_ws: WebSocket, call_id: str):
-    """Bridge between client WebSocket and Gemini Live API"""
-    try:
-        async with websockets.connect(GEMINI_LIVE_URL) as gemini_ws:
-            # Setup Gemini session
-            setup_msg = {
-                "setup": {
-                    "model": f"models/{settings.gemini_live_model}",
-                    "generation_config": {
-                        "response_modalities": ["AUDIO"],
-                        "speech_config": {
-                            "voice_config": {
-                                "prebuilt_voice_config": {"voice_name": "Puck"}
-                            }
-                        }
-                    },
-                    "system_instruction": {
-                        "parts": [{
-                            "text": "You are Priya, a polite, smart Indian AI voice assistant. Speak concisely in natural Hindi/Hinglish."
-                        }]
-                    }
-                }
-            }
-            await gemini_ws.send(json.dumps(setup_msg))
-
-            # Client → Gemini
-            async def phone_to_gemini():
-                while True:
-                    message = await client_ws.receive_text()
-                    data = json.loads(message)
-                    if data.get("event") == "media":
-                        payload = data["media"]["payload"]
-                        audio_msg = {
-                            "realtime_input": {
-                                "media_chunks": [{
-                                    "mime_type": "audio/pcm;rate=16000",
-                                    "data": payload
-                                }]
-                            }
-                        }
-                        await gemini_ws.send(json.dumps(audio_msg))
-                    elif data.get("event") == "stop":
-                        break
-
-            # Gemini → Client
-            async def gemini_to_phone():
-                async for message in gemini_ws:
-                    response = json.loads(message)
-                    server_content = response.get("serverContent", {})
-                    parts = server_content.get("modelTurn", {}).get("parts", [])
-                    for part in parts:
-                        inline_data = part.get("inlineData")
-                        if inline_data:
-                            audio_b64 = inline_data.get("data")
-                            await client_ws.send_json({
-                                "event": "media",
-                                "media": {"payload": audio_b64}
-                            })
-
-            await asyncio.gather(phone_to_gemini(), gemini_to_phone())
-
-    except WebSocketDisconnect:
-        print(f"🔌 Call disconnected: {call_id}")
-    except Exception as e:
-        print(f"❌ Gemini Live Error ({call_id}): {e}")
-
-
-@router.websocket("/call/{call_id}")
-async def websocket_call(websocket: WebSocket, call_id: str):
-    """WebSocket endpoint for live voice calls"""
-    await manager.connect(call_id, websocket)
-    manager.start_cleanup()
+    conversation_history = [
+        {"role": "system", "content": system_prompt}
+    ]
 
     try:
-        await gemini_live_session(websocket, call_id)
+        while True:
+            # 1. क्लाइंट से टेक्स्ट या ट्रांसक्रिप्ट रिसीव करें
+            data = await websocket.receive_text()
+            event = json.loads(data)
+            user_text = event.get("text", "").strip()
+
+            if not user_text:
+                continue
+
+            # 2. तुरंत नेचुरल फिलर (Ahhs, रुको, Let me see) ऑडियो भेजना ताकि लेटेंसी फील न हो
+            filler_text = PersonaMatrix.get_filler(agent_id, category="thinking")
+            await websocket.send_json({
+                "type": "filler",
+                "text": filler_text
+            })
+
+            # 3. LLM प्रोसेसिंग (Groq Llama-3 8B - Fast & Free)
+            conversation_history.append({"role": "user", "content": user_text})
+            
+            chat_completion = await groq_client.chat.completions.create(
+                messages=conversation_history,
+                model="llama3-8b-8192",
+                temperature=0.6,
+                max_tokens=80
+            )
+            response_text = chat_completion.choices[0].message.content
+            conversation_history.append({"role": "assistant", "content": response_text})
+
+            # 4. फ्री TTS जनरेशन (Microsoft Edge-TTS)
+            voice_name = profile.get("voice", "hi-IN-MadhurNeural")
+            tts = edge_tts.Communicate(response_text, voice_name)
+            
+            audio_buffer = bytearray()
+            async for chunk in tts.stream():
+                if chunk["type"] == "audio":
+                    audio_buffer.extend(chunk["data"])
+
+            # 5. ऑडियो बाइट्स और टेक्स्ट वापस क्लाइंट को स्ट्रीम करना
+            await websocket.send_json({
+                "type": "response_text",
+                "text": response_text
+            })
+            await websocket.send_bytes(bytes(audio_buffer))
+
     except WebSocketDisconnect:
-        print(f"📴 Call disconnected: {call_id}")
+        logger.info(f"Session closed for agent: {agent_id}")
     except Exception as e:
-        print(f"❌ Call runtime error: {e}")
-    finally:
-        manager.disconnect(call_id)
+        logger.error(f"Error in voice stream pipeline: {str(e)}")
+        await websocket.close()
