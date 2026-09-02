@@ -1,56 +1,38 @@
-"""
-Singh Ji Voice AI Agent v2.4
-FastAPI App, CORS, Lifespan, Routers Mount
-"""
-
-import os
+import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 from config.settings import settings
-from core.connection_manager import manager
 from routers import voice_ws, telegram_webhook
 
-# ═══════════════════════════════════════════════════════════════════
-# LIFESPAN
-# ═══════════════════════════════════════════════════════════════════
+# Logging Setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("singhji-voice-agent")
 
-_start_time: datetime = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _start_time
-    _start_time = datetime.now()
-
-    print("🚀 Singh Ji Voice Agent v2.4 initialized...")
-    print("   📞 Phone Calls: Gemini Live (True Voice-to-Voice)")
-    print("   🤖 LLM Fallback: Groq -> Gemini -> OpenRouter -> Hugging Face")
-    print("   🎤 STT: Groq Whisper-Large-V3")
-    print("   🔊 TTS: Smart Tuned Edge-TTS (Priya/Singh Ji Persona)")
-    print("   🤖 Telegram Bot: Webhook Ready")
-
-    # Start connection cleanup
-    manager.start_cleanup()
-
+    """
+    Startup और Shutdown Lifecycle Events
+    """
+    logger.info("🚀 Starting singhji-voice-agent core engine...")
+    # Cloud/API connections warm-up logic
     yield
+    logger.info("🛑 Shutting down singhji-voice-agent gracefully...")
 
-    print("🛑 Server shutdown completed.")
-
-# ═══════════════════════════════════════════════════════════════════
-# APP INIT
-# ═══════════════════════════════════════════════════════════════════
 
 app = FastAPI(
-    title="Singh Ji Voice AI Agent",
-    version="2.4.0",
-    description="Real-time Voice AI with Telegram & WebSocket support",
+    title="SinghJi Voice Agent Engine",
+    version="1.0.0",
     lifespan=lifespan
 )
 
-# CORS
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,56 +41,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ═══════════════════════════════════════════════════════════════════
-# ROUTERS
-# ═══════════════════════════════════════════════════════════════════
+# Routers Mount
+app.include_router(voice_ws.router, prefix="/voice", tags=["Live Voice Stream"])
+app.include_router(telegram_webhook.router, prefix="/telegram", tags=["Telegram Webhook"])
 
-app.include_router(voice_ws.router)
-app.include_router(telegram_webhook.router)
 
-# ═══════════════════════════════════════════════════════════════════
-# ROOT & HEALTH
-# ═══════════════════════════════════════════════════════════════════
-
-@app.get("/")
-async def root():
-    return {
-        "service": "Singh Ji Voice AI Agent",
-        "version": "2.4.0",
-        "status": "online",
-        "endpoints": {
-            "health": "/api/health",
-            "websocket_call": "/ws/call/{call_id}",
-            "telegram_webhook": "/webhook/telegram"
-        }
-    }
-
-@app.get("/api/health")
+@app.get("/health", tags=["System"])
 async def health_check():
-    from config.settings import settings
-
-    uptime = None
-    if _start_time:
-        uptime = (datetime.now() - _start_time).total_seconds()
-
     return {
         "status": "healthy",
-        "version": "2.4.0",
-        "groq_whisper": bool(settings.groq_api_key),
-        "gemini_live": bool(settings.gemini_api_key),
-        "openrouter": bool(settings.openrouter_api_key),
-        "huggingface": bool(settings.huggingface_api_key),
-        "telegram_bot": bool(settings.telegram_voice_bot_token),
-        "active_calls_count": len(manager.active_connections),
-        "memory_history_sessions": 0,  # TODO: track from conversation_history
-        "uptime_seconds": uptime
+        "service": "singhji-voice-agent",
+        "version": "1.0.0"
     }
 
-# ═══════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", settings.port))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(
+        "main.py:app",
+        host="0.0.0.0",
+        port=settings.PORT if hasattr(settings, "PORT") else 8000,
+        reload=True
+    )
