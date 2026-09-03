@@ -1,4 +1,4 @@
-Singh Ji Voice AI — Ultimate Free Edition
+i Voice AI — Ultimate Free Edition
 300+ free TTS voices | Edge TTS + Kokoro + Piper | Cloud deploy ready
 https://python.org
 LICENSE
