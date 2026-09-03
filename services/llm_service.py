@@ -1,183 +1,225 @@
 """
-5-Layer LLM Fallback Service
-Groq → Sarvam → Gemini → OpenRouter → Hugging Face
+Singh Ji Voice AI — LLM Service
+5-Layer Free Fallback: Groq → Gemini → OpenRouter → HF → Local
 """
 
+import os
 import asyncio
-import re
-from typing import List, Dict, Optional
+from typing import Optional, AsyncGenerator
 import httpx
-from groq import Groq
 
-from config.settings import settings, GROQ_MODELS
-
-
-# HTTP client
-_http_client: Optional[httpx.AsyncClient] = None
-
-def _get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=15.0)
-    return _http_client
-
-
-# Groq client
-groq_client = Groq(api_key=settings.groq_api_key) if settings.groq_api_key else None
+from config import settings
 
 
 class LLMService:
-    """Multi-provider LLM with automatic fallback"""
+    """
+    5-Layer LLM Fallback System
+    All free tiers, auto-fallback on failure
+    """
 
-    @staticmethod
-    def clean_response(text: str) -> str:
-        """Clean AI thinking artifacts"""
-        text = re.sub(r'\s*thinking\s*.*?\s*end_thinking\s*', '', text, flags=re.DOTALL)
-        text = re.sub(r"Here\'s a thinking process:.*?\n", '', text, flags=re.DOTALL)
-        text = re.sub(r'Thinking:.*?\n', '', text, flags=re.DOTALL)
-        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-        text = re.sub(r'[\*\_#`]', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
+    def __init__(self):
+        self.groq_client = None
+        self.gemini_client = None
+        self.openrouter_client = None
+        self._init_clients()
 
-    @staticmethod
-    def _build_messages(user_text: str, system_prompt: str, history: List[Dict] = None) -> List[Dict]:
-        """Build message array with history"""
-        messages = [{"role": "system", "content": system_prompt}]
-        if history:
-            for h in history[-4:]:
-                messages.append({"role": "user", "content": h.get("user", "")})
-                messages.append({"role": "assistant", "content": h.get("ai", "")})
-        messages.append({"role": "user", "content": user_text})
-        return messages
-
-    @classmethod
-    async def _try_groq(cls, messages: List[Dict]) -> str:
-        """Groq API with multiple model fallback"""
-        if not settings.groq_api_key or groq_client is None:
-            raise Exception("Groq not configured")
-
-        for model in GROQ_MODELS:
+    def _init_clients(self):
+        """Lazy init API clients"""
+        # Groq
+        if settings.GROQ_API_KEY:
             try:
-                def _call():
-                    return groq_client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        max_tokens=120,
-                        temperature=0.6
-                    )
-                resp = await asyncio.to_thread(_call)
-                return resp.choices[0].message.content
+                from groq import Groq
+                self.groq_client = Groq(api_key=settings.GROQ_API_KEY)
+            except ImportError:
+                pass
+
+        # Gemini
+        if settings.GEMINI_API_KEY:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=settings.GEMINI_API_KEY)
+                self.gemini_client = genai
+            except ImportError:
+                pass
+
+        # OpenRouter (uses OpenAI-compatible client)
+        if settings.OPENROUTER_API_KEY:
+            try:
+                from openai import AsyncOpenAI
+                self.openrouter_client = AsyncOpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=settings.OPENROUTER_API_KEY
+                )
+            except ImportError:
+                pass
+
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 500,
+        model: Optional[str] = None
+    ) -> str:
+        """
+        Generate response with auto-fallback
+
+        Priority: Groq → Gemini → OpenRouter → HF Inference → Error
+        """
+        # Layer 1: Groq (fastest, 20 req/min free)
+        if self.groq_client:
+            try:
+                return await self._groq_generate(prompt, system_prompt, temperature, max_tokens, model)
             except Exception as e:
-                print(f"⚠️ Groq {model} failed: {e}")
-                continue
-        raise Exception("All Groq models failed")
+                print(f"⚠️ Groq failed: {e}")
 
-    @classmethod
-    async def _try_gemini(cls, messages: List[Dict]) -> str:
-        """Gemini API fallback"""
-        if not settings.gemini_api_key:
-            raise Exception("Gemini not configured")
+        # Layer 2: Gemini (60 req/min free)
+        if self.gemini_client:
+            try:
+                return await self._gemini_generate(prompt, system_prompt, temperature, max_tokens)
+            except Exception as e:
+                print(f"⚠️ Gemini failed: {e}")
 
-        client = _get_http_client()
-        prompt_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        # Layer 3: OpenRouter (free tier)
+        if self.openrouter_client:
+            try:
+                return await self._openrouter_generate(prompt, system_prompt, temperature, max_tokens)
+            except Exception as e:
+                print(f"⚠️ OpenRouter failed: {e}")
 
-        resp = await client.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-            headers={
-                "x-goog-api-key": settings.gemini_api_key,
-                "Content-Type": "application/json"
-            },
-            json={"contents": [{"parts": [{"text": prompt_text}]}]}
+        # Layer 4: HuggingFace Inference API
+        if settings.HF_API_TOKEN:
+            try:
+                return await self._hf_generate(prompt, system_prompt, temperature, max_tokens)
+            except Exception as e:
+                print(f"⚠️ HF failed: {e}")
+
+        # All layers failed
+        raise RuntimeError("All LLM services failed. Please check API keys.")
+
+    async def _groq_generate(
+        self, prompt: str, system_prompt: Optional[str],
+        temperature: float, max_tokens: int, model: Optional[str]
+    ) -> str:
+        """Groq API call"""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        model_name = model or settings.GROQ_MODEL
+
+        response = self.groq_client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
         )
-        data = resp.json()
 
-        if "error" in data:
-            raise Exception(f"Gemini error: {data['error']}")
+        return response.choices[0].message.content
 
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+    async def _gemini_generate(
+        self, prompt: str, system_prompt: Optional[str],
+        temperature: float, max_tokens: int
+    ) -> str:
+        """Gemini API call"""
+        model = self.gemini_client.GenerativeModel(settings.GEMINI_MODEL)
 
-    @classmethod
-    async def _try_openrouter(cls, messages: List[Dict]) -> str:
-        """OpenRouter API fallback"""
-        if not settings.openrouter_api_key:
-            raise Exception("OpenRouter not configured")
+        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
-        client = _get_http_client()
-        resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.openrouter_api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://singh-ji-voice-agent.onrender.com",
-                "X-Title": "Singh Ji AI"
-            },
-            json={
-                "model": "openrouter/free",
-                "messages": messages,
-                "max_tokens": 120,
-                "temperature": 0.6
+        response = model.generate_content(
+            full_prompt,
+            generation_config={
+                "temperature": temperature,
+                "max_output_tokens": max_tokens
             }
         )
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
 
-    @classmethod
-    async def _try_huggingface(cls, messages: List[Dict]) -> str:
-        """Hugging Face API fallback"""
-        if not settings.huggingface_api_key:
-            raise Exception("HuggingFace not configured")
+        return response.text
 
-        client = _get_http_client()
-        system_prompt = messages[0]["content"]
-        user_text = messages[-1]["content"]
-
-        hf_url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-        prompt_full = f"<s>[INST] {system_prompt}\n\nUser: {user_text} [/INST]"
-
-        resp = await client.post(
-            hf_url,
-            headers={"Authorization": f"Bearer {settings.huggingface_api_key}"},
-            json={"inputs": prompt_full, "parameters": {"max_new_tokens": 120, "temperature": 0.6}}
-        )
-        data = resp.json()
-
-        if isinstance(data, list) and len(data) > 0:
-            generated = data[0].get("generated_text", "")
-            return generated.split("[/INST]")[-1].strip()
-        raise Exception("Invalid HF response format")
-
-    @classmethod
-    async def get_response(
-        cls,
-        user_text: str,
-        system_prompt: str,
-        history: List[Dict] = None
+    async def _openrouter_generate(
+        self, prompt: str, system_prompt: Optional[str],
+        temperature: float, max_tokens: int
     ) -> str:
-        """Get AI response with automatic fallback"""
-        messages = cls._build_messages(user_text, system_prompt, history)
+        """OpenRouter API call"""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
 
-        providers = [
-            ("Groq", cls._try_groq, bool(settings.groq_api_key)),
-            ("Gemini", cls._try_gemini, bool(settings.gemini_api_key)),
-            ("OpenRouter", cls._try_openrouter, bool(settings.openrouter_api_key)),
-            ("HuggingFace", cls._try_huggingface, bool(settings.huggingface_api_key)),
-        ]
+        response = await self.openrouter_client.chat.completions.create(
+            model=settings.OPENROUTER_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_headers={
+                "HTTP-Referer": "https://singhji-ai.com",
+                "X-Title": "Singh Ji Voice AI"
+            }
+        )
 
-        for name, fn, has_key in providers:
-            if not has_key:
-                continue
-            try:
-                raw = await fn(messages)
-                clean = cls.clean_response(raw)
-                if clean:
-                    return clean
-            except Exception as e:
-                print(f"⚠️ {name} failed: {e}")
-                continue
+        return response.choices[0].message.content
 
-        return "जी, मैं आपकी बात समझ नहीं पाई। क्या आप दोबारा कह सकते हैं?"
+    async def _hf_generate(
+        self, prompt: str, system_prompt: Optional[str],
+        temperature: float, max_tokens: int
+    ) -> str:
+        """HuggingFace Inference API call"""
+        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://api-inference.huggingface.co/models/{settings.HF_LLM_MODEL}",
+                headers={"Authorization": f"Bearer {settings.HF_API_TOKEN}"},
+                json={
+                    "inputs": full_prompt,
+                    "parameters": {
+                        "temperature": temperature,
+                        "max_new_tokens": max_tokens
+                    }
+                },
+                timeout=30.0
+            )
+
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                return result[0].get("generated_text", "")
+            return str(result)
+
+    async def stream_generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7
+    ) -> AsyncGenerator[str, None]:
+        """Stream response token by token (Groq only)"""
+        if not self.groq_client:
+            # Fallback to non-streaming
+            response = await self.generate(prompt, system_prompt, temperature)
+            yield response
+            return
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            stream = self.groq_client.chat.completions.create(
+                model=settings.GROQ_MODEL,
+                messages=messages,
+                temperature=temperature,
+                stream=True
+            )
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except Exception as e:
+            print(f"⚠️ Streaming failed: {e}")
+            response = await self.generate(prompt, system_prompt, temperature)
+            yield response
 
 
-# Singleton
+# Global LLM service instance
 llm_service = LLMService()
