@@ -1,55 +1,141 @@
 """
-Audio Converter Utilities
+Singh Ji Voice AI — Audio Converter
 PyDub / AudioOps memory-safe converter
 """
 
 import io
-import wave
-import numpy as np
-from pydub import AudioSegment
+import audioop
+from typing import Optional
 
 
 class AudioConverter:
-    """Memory-safe audio format conversions"""
+    """
+    Memory-safe audio format converter
+    Supports: MP3, WAV, OGG, Mu-Law, PCM
+    """
 
     @staticmethod
-    def ogg_to_wav(ogg_bytes: bytes) -> bytes:
-        """Convert OGG to WAV bytes"""
-        audio = AudioSegment.from_file(io.BytesIO(ogg_bytes), format="ogg")
-        wav_io = io.BytesIO()
-        audio.export(wav_io, format="wav")
-        wav_io.seek(0)
-        return wav_io.read()
+    def convert(
+        input_data: bytes,
+        input_format: str,
+        output_format: str,
+        sample_rate: Optional[int] = None
+    ) -> bytes:
+        """
+        Convert audio between formats
+
+        Args:
+            input_data: Raw audio bytes
+            input_format: Source format (mp3, wav, ogg, mulaw, pcm)
+            output_format: Target format (mp3, wav, ogg, mulaw, pcm)
+            sample_rate: Target sample rate (optional)
+
+        Returns:
+            Converted audio bytes
+        """
+        try:
+            from pydub import AudioSegment
+
+            # Load input
+            if input_format == "mp3":
+                audio = AudioSegment.from_mp3(io.BytesIO(input_data))
+            elif input_format == "wav":
+                audio = AudioSegment.from_wav(io.BytesIO(input_data))
+            elif input_format == "ogg":
+                audio = AudioSegment.from_file(io.BytesIO(input_data), format="ogg")
+            elif input_format == "mulaw":
+                # Mu-Law 8k → PCM
+                pcm = audioop.ulaw2lin(input_data, 2)
+                audio = AudioSegment(
+                    data=pcm,
+                    sample_width=2,
+                    frame_rate=8000,
+                    channels=1
+                )
+            elif input_format == "pcm":
+                audio = AudioSegment(
+                    data=input_data,
+                    sample_width=2,
+                    frame_rate=sample_rate or 16000,
+                    channels=1
+                )
+            else:
+                raise ValueError(f"Unsupported input format: {input_format}")
+
+            # Apply sample rate if specified
+            if sample_rate:
+                audio = audio.set_frame_rate(sample_rate)
+
+            # Export to output format
+            buffer = io.BytesIO()
+
+            if output_format == "mp3":
+                audio.export(buffer, format="mp3")
+            elif output_format == "wav":
+                audio.export(buffer, format="wav")
+            elif output_format == "ogg":
+                audio.export(buffer, format="ogg", codec="libopus")
+            elif output_format == "mulaw":
+                # PCM → Mu-Law 8k
+                audio = audio.set_frame_rate(8000).set_channels(1)
+                pcm_data = audio.raw_data
+                mulaw = audioop.lin2ulaw(pcm_data, 2)
+                return mulaw
+            elif output_format == "pcm":
+                audio = audio.set_channels(1)
+                return audio.raw_data
+            else:
+                raise ValueError(f"Unsupported output format: {output_format}")
+
+            return buffer.getvalue()
+
+        except ImportError:
+            raise ImportError("pydub not installed. Run: pip install pydub")
 
     @staticmethod
-    def wav_to_ogg(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
-        """Convert WAV to OGG/Opus"""
-        audio = AudioSegment.from_file(io.BytesIO(wav_bytes), format="wav")
-        ogg_io = io.BytesIO()
-        audio.export(ogg_io, format="ogg", codec="libopus", parameters=["-b:a", bitrate])
-        ogg_io.seek(0)
-        return ogg_io.read()
+    def get_duration(audio_data: bytes, format: str) -> float:
+        """Get audio duration in seconds"""
+        try:
+            from pydub import AudioSegment
+
+            if format == "mp3":
+                audio = AudioSegment.from_mp3(io.BytesIO(audio_data))
+            elif format == "wav":
+                audio = AudioSegment.from_wav(io.BytesIO(audio_data))
+            elif format == "ogg":
+                audio = AudioSegment.from_file(io.BytesIO(audio_data), format="ogg")
+            else:
+                return 0.0
+
+            return len(audio) / 1000.0  # pydub gives ms
+
+        except:
+            return 0.0
 
     @staticmethod
-    def resample(audio_bytes: bytes, target_rate: int = 16000, format_in: str = "wav") -> bytes:
-        """Resample audio to target sample rate"""
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=format_in)
-        audio = audio.set_frame_rate(target_rate).set_channels(1)
-        out_io = io.BytesIO()
-        audio.export(out_io, format=format_in)
-        out_io.seek(0)
-        return out_io.read()
+    def normalize_volume(audio_data: bytes, format: str, target_db: float = -20.0) -> bytes:
+        """Normalize audio volume to target dB"""
+        try:
+            from pydub import AudioSegment
 
-    @staticmethod
-    def normalize(audio_bytes: bytes, format_in: str = "wav") -> bytes:
-        """Normalize audio volume"""
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=format_in)
-        audio = audio.normalize()
-        out_io = io.BytesIO()
-        audio.export(out_io, format=format_in)
-        out_io.seek(0)
-        return out_io.read()
+            if format == "mp3":
+                audio = AudioSegment.from_mp3(io.BytesIO(audio_data))
+            elif format == "wav":
+                audio = AudioSegment.from_wav(io.BytesIO(audio_data))
+            else:
+                return audio_data
+
+            # Normalize
+            change_in_db = target_db - audio.dBFS
+            normalized = audio.apply_gain(change_in_db)
+
+            buffer = io.BytesIO()
+            normalized.export(buffer, format=format)
+            return buffer.getvalue()
+
+        except:
+            return audio_data
 
 
-# Singleton
+# Global converter instance
 audio_converter = AudioConverter()
