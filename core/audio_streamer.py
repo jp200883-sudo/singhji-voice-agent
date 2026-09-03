@@ -1,103 +1,111 @@
 """
-Audio Streaming Utilities
-Mulaw 8k ↔ PCM 16k ↔ OGG/Opus conversions
+Singh Ji Voice AI — Audio Streamer
+Audio format conversion: Mu-Law 8k ↔ PCM 16k ↔ OGG/Opus
+Memory-safe streaming for telephony and Telegram
 """
 
 import io
-import wave
+import struct
+import audioop
+from typing import AsyncGenerator, Optional
 import numpy as np
-from typing import Optional
-from pydub import AudioSegment
-
-
-SAMPLE_RATE = 16000
-
-
-def decode_mulaw(audio_data: bytes) -> np.ndarray:
-    """Decode μ-law to float32 PCM"""
-    mu = 255
-    audio = np.frombuffer(audio_data, dtype=np.uint8).astype(np.float32)
-    audio = (audio / mu) * 2 - 1
-    audio = np.clip(audio, -1.0, 1.0)
-    audio = np.sign(audio) * (np.exp(mu * np.abs(audio)) - 1) / (np.exp(mu) - 1)
-    return audio
-
-
-def encode_mulaw(audio: np.ndarray) -> bytes:
-    """Encode float32 PCM to μ-law"""
-    mu = 255
-    audio = np.clip(audio, -1, 1)
-    audio = np.sign(audio) * np.log(1 + mu * np.abs(audio)) / np.log(1 + mu)
-    audio = ((audio + 1) / 2 * mu).astype(np.uint8)
-    return audio.tobytes()
-
-
-def pcm_float_to_wav_bytes(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
-    """Convert float32 PCM to WAV bytes"""
-    audio_int16 = np.clip(audio, -1, 1)
-    audio_int16 = (audio_int16 * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(audio_int16.tobytes())
-    buf.seek(0)
-    return buf.read()
-
-
-def detect_gender_from_pitch(pcm_audio: np.ndarray, sample_rate: int = 16000) -> str:
-    """Detect caller gender from voice pitch"""
-    try:
-        audio = pcm_audio - np.mean(pcm_audio)
-        corr = np.correlate(audio, audio, mode="full")
-        corr = corr[len(corr) // 2:]
-
-        min_lag = int(sample_rate / 300)
-        max_lag = int(sample_rate / 75)
-
-        if max_lag >= len(corr):
-            return "unknown"
-
-        segment = corr[min_lag:max_lag]
-        if len(segment) == 0:
-            return "unknown"
-
-        peak_lag = np.argmax(segment) + min_lag
-        if peak_lag == 0:
-            return "unknown"
-
-        pitch_hz = sample_rate / peak_lag
-        return "male" if pitch_hz < 165 else "female"
-    except Exception as e:
-        print(f"⚠️ Gender detection error: {e}")
-        return "unknown"
 
 
 class AudioStreamer:
-    """Handles audio format conversions for telephony"""
+    """
+    Audio Format Converter & Streamer
+    Supports: Mu-Law, PCM, OGG/Opus, MP3
+    """
+
+    # Audio format constants
+    MULAW_RATE = 8000
+    PCM_RATE = 16000
+    OUTPUT_RATE = 24000
 
     @staticmethod
-    def ogg_to_pcm(ogg_bytes: bytes) -> np.ndarray:
-        """Convert OGG/Opus to float32 PCM"""
-        audio = AudioSegment.from_file(io.BytesIO(ogg_bytes), format="ogg")
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-
-        wav_buf = io.BytesIO()
-        audio.export(wav_buf, format="wav")
-        wav_buf.seek(0)
-
-        with wave.open(wav_buf, 'rb') as wf:
-            frames = wf.readframes(wf.getnframes())
-            return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
+    def mulaw_to_pcm(mulaw_data: bytes) -> bytes:
+        """Convert Mu-Law 8k to PCM 16k"""
+        # Mu-Law decode
+        pcm_data = audioop.ulaw2lin(mulaw_data, 2)
+        # Resample 8k → 16k
+        pcm_16k = audioop.ratecv(pcm_data, 2, 1, 8000, 16000, None)[0]
+        return pcm_16k
 
     @staticmethod
-    def pcm_to_ogg(pcm_audio: np.ndarray, bitrate: str = "128k") -> bytes:
-        """Convert float32 PCM to OGG/Opus"""
-        wav_bytes = pcm_float_to_wav_bytes(pcm_audio)
-        audio = AudioSegment.from_file(io.BytesIO(wav_bytes), format="wav")
+    def pcm_to_mulaw(pcm_data: bytes, input_rate: int = 16000) -> bytes:
+        """Convert PCM to Mu-Law 8k for telephony"""
+        # Resample to 8k if needed
+        if input_rate != 8000:
+            pcm_8k = audioop.ratecv(pcm_data, 2, 1, input_rate, 8000, None)[0]
+        else:
+            pcm_8k = pcm_data
+        # Encode to Mu-Law
+        mulaw_data = audioop.lin2ulaw(pcm_8k, 2)
+        return mulaw_data
 
-        ogg_io = io.BytesIO()
-        audio.export(ogg_io, format="ogg", codec="libopus", parameters=["-b:a", bitrate])
-        ogg_io.seek(0)
-        return ogg_io.read()
+    @staticmethod
+    def pcm_to_opus(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+        """Convert PCM to OGG/Opus (for Telegram)"""
+        try:
+            from pydub import AudioSegment
+            # Create audio segment from PCM
+            audio = AudioSegment(
+                data=pcm_data,
+                sample_width=2,
+                frame_rate=sample_rate,
+                channels=1
+            )
+            # Export to OGG/Opus
+            buffer = io.BytesIO()
+            audio.export(buffer, format="ogg", codec="libopus", parameters=["-vbr", "on"])
+            return buffer.getvalue()
+        except Exception as e:
+            print(f"Opus conversion failed: {e}")
+            return pcm_data
+
+    @staticmethod
+    def opus_to_pcm(opus_data: bytes) -> bytes:
+        """Convert OGG/Opus to PCM"""
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_file(io.BytesIO(opus_data), format="ogg")
+            # Convert to mono 16k PCM
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            return audio.raw_data
+        except Exception as e:
+            print(f"Opus decode failed: {e}")
+            return b""
+
+    @staticmethod
+    def mp3_to_pcm(mp3_data: bytes) -> bytes:
+        """Convert MP3 to PCM"""
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_mp3(io.BytesIO(mp3_data))
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            return audio.raw_data
+        except Exception as e:
+            print(f"MP3 decode failed: {e}")
+            return b""
+
+    @staticmethod
+    def chunk_audio(audio_data: bytes, chunk_size: int = 320) -> AsyncGenerator[bytes, None]:
+        """Stream audio in chunks for real-time playback"""
+        for i in range(0, len(audio_data), chunk_size):
+            yield audio_data[i:i + chunk_size]
+
+    @staticmethod
+    def normalize_audio(pcm_data: bytes) -> bytes:
+        """Normalize audio volume"""
+        return audioop.normalize(pcm_data, 2, 1, 32767)
+
+    @staticmethod
+    def add_silence(pcm_data: bytes, duration_ms: int = 500, sample_rate: int = 16000) -> bytes:
+        """Add silence padding"""
+        silence_bytes = int(sample_rate * 2 * duration_ms / 1000)
+        silence = b"\x00" * silence_bytes
+        return silence + pcm_data + silence
+
+
+# Global audio streamer instance
+audio_streamer = AudioStreamer()
