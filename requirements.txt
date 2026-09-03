@@ -1,7 +1,31 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.28.0
-pydantic-settings>=2.2.0
-groq>=0.5.0
-edge-tts>=6.1.10
-python-dotenv>=1.0.1
-websockets>=12.0
+Singh Ji Voice AI — Requirements
+# pip install -r requirements.txt
+
+# === Core ===
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# === Configuration ===
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# === TTS Engines ===
+edge-tts>=6.1.9          # Microsoft Edge TTS — 200+ voices, no API key
+kokoro>=0.9.2            # Kokoro TTS — 82M params, MOS 4.2, local
+soundfile>=0.12.1        # Audio I/O for Kokoro
+piper-tts>=1.2.0         # Piper TTS — Edge optimized, ONNX
+onnxruntime>=1.16.0      # ONNX runtime for Piper
+
+# === STT (Optional) ===
+# openai-whisper>=20231117  # Whisper STT
+# speechrecognition>=3.10   # Google STT fallback
+
+# === Utils ===
+aiofiles>=23.2.1
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# === Dev ===
+pytest>=7.4.0
+httpx>=0.25.0
