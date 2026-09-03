@@ -1,139 +1,124 @@
 """
-Singh Ji Voice AI — Helpers
-Text cleaners, token counters, logging
+Singh Ji Voice AI v3.0 - Error Handler
+5-Layer LLM Fallback + 4-Layer STT Fallback
+Graceful degradation with retry logic
 """
 
-import re
+import asyncio
 import logging
-from typing import Optional
+from functools import wraps
+from typing import Callable, Any, Optional
+import time
 
+logger = logging.getLogger("singhji_voice")
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("singhji-voice-ai")
+# Retry decorator with exponential backoff
+def retry_with_fallback(max_retries: int = 3, backoff_factor: float = 2.0):
+    def decorator(func: Callable):
+        @wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    wait_time = backoff_factor ** attempt
+                    logger.warning(f"{func.__name__} attempt {attempt+1}/{max_retries} failed: {str(e)}. Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+            logger.error(f"{func.__name__} failed after {max_retries} attempts: {str(last_exception)}")
+            raise last_exception
+        
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    wait_time = backoff_factor ** attempt
+                    logger.warning(f"{func.__name__} attempt {attempt+1}/{max_retries} failed: {str(e)}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+            logger.error(f"{func.__name__} failed after {max_retries} attempts: {str(last_exception)}")
+            raise last_exception
+        
+        return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+    return decorator
 
+# 5-Layer LLM Fallback Chain
+LLM_FALLBACK_CHAIN = [
+    "groq",      # Layer 1: Fastest, cheapest
+    "gemini",    # Layer 2: Google backup
+    "local",     # Layer 3: Local model (if available)
+    "hf_inf",    # Layer 4: HuggingFace Inference API
+    "rule"       # Layer 5: Rule-based (always works)
+]
 
-class TextCleaner:
-    """Text preprocessing utilities"""
+# 4-Layer STT Fallback Chain
+STT_FALLBACK_CHAIN = [
+    "hf_bucket",  # Layer 1: HF zero-stt-hinglish bucket
+    "whisper",    # Layer 2: OpenAI Whisper
+    "google",     # Layer 3: Google Speech Recognition
+    "vosk"        # Layer 4: Offline Vosk (last resort)
+]
 
-    @staticmethod
-    def clean_for_tts(text: str) -> str:
-        """Clean text for TTS synthesis"""
-        # Remove URLs
-        text = re.sub(r"https?://\S+|www\.\S+", "", text)
-        # Remove email addresses
-        text = re.sub(r"\S+@\S+", "", text)
-        # Remove excessive whitespace
-        text = re.sub(r"\s+", " ", text)
-        # Remove special chars that break TTS
-        text = re.sub(r"[*#_~`\[\]\(\)]", "", text)
-        # Trim
-        text = text.strip()
-        return text
+class FallbackManager:
+    """Manages fallback chains for LLM and STT"""
+    
+    def __init__(self):
+        self.llm_status = {name: True for name in LLM_FALLBACK_CHAIN}
+        self.stt_status = {name: True for name in STT_FALLBACK_CHAIN}
+        self.circuit_breaker = {}  # Track failures per service
+    
+    def mark_failed(self, service_type: str, service_name: str):
+        """Mark a service as temporarily failed"""
+        if service_type == "llm":
+            self.llm_status[service_name] = False
+        elif service_type == "stt":
+            self.stt_status[service_name] = False
+        self.circuit_breaker[service_name] = time.time()
+        logger.warning(f"Service {service_name} marked as failed. Circuit breaker active.")
+    
+    def is_available(self, service_type: str, service_name: str) -> bool:
+        """Check if service is available (circuit breaker recovery)"""
+        if service_name in self.circuit_breaker:
+            # Auto-recover after 5 minutes
+            if time.time() - self.circuit_breaker[service_name] > 300:
+                self.circuit_breaker.pop(service_name)
+                if service_type == "llm":
+                    self.llm_status[service_name] = True
+                elif service_type == "stt":
+                    self.stt_status[service_name] = True
+                logger.info(f"Service {service_name} auto-recovered.")
+                return True
+            return False
+        return True
+    
+    def get_llm_chain(self) -> list:
+        """Get available LLM services in priority order"""
+        return [s for s in LLM_FALLBACK_CHAIN if self.is_available("llm", s)]
+    
+    def get_stt_chain(self) -> list:
+        """Get available STT services in priority order"""
+        return [s for s in STT_FALLBACK_CHAIN if self.is_available("stt", s)]
 
-    @staticmethod
-    def clean_for_stt(text: str) -> str:
-        """Clean STT transcript"""
-        # Remove filler words
-        fillers = ["um", "uh", "ah", "hmm", "like", "you know"]
-        for filler in fillers:
-            text = re.sub(rf"\b{filler}\b", "", text, flags=re.IGNORECASE)
-        # Normalize whitespace
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+# Global fallback manager
+fallback_mgr = FallbackManager()
 
-    @staticmethod
-    def detect_language(text: str) -> str:
-        """Detect if text is Hindi, Hinglish, or English"""
-        # Count Hindi characters (Devanagari range)
-        hindi_chars = len(re.findall(r"[\u0900-\u097F]", text))
-        total_chars = len(text.strip())
+# Timeout wrapper
+async def with_timeout(coro, timeout: float = 10.0, fallback_value: Any = None):
+    """Execute coroutine with timeout"""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error(f"Operation timed out after {timeout}s")
+        if fallback_value is not None:
+            return fallback_value
+        raise
 
-        if total_chars == 0:
-            return "en"
-
-        hindi_ratio = hindi_chars / total_chars
-
-        if hindi_ratio > 0.5:
-            return "hi"  # Pure Hindi
-        elif hindi_ratio > 0.1:
-            return "hi"  # Hinglish (has some Hindi)
-        else:
-            return "en"  # English
-
-    @staticmethod
-    def split_long_text(text: str, max_chars: int = 500) -> list:
-        """Split long text into chunks for TTS"""
-        if len(text) <= max_chars:
-            return [text]
-
-        chunks = []
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        current_chunk = ""
-
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= max_chars:
-                current_chunk += " " + sentence if current_chunk else sentence
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence
-
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-
-        return chunks
-
-
-class TokenCounter:
-    """Estimate token counts for rate limiting"""
-
-    @staticmethod
-    def estimate_tokens(text: str) -> int:
-        """Rough estimate: ~4 chars per token for English, ~2 for Hindi"""
-        hindi_chars = len(re.findall(r"[\u0900-\u097F]", text))
-        other_chars = len(text) - hindi_chars
-
-        # Hindi: ~2 chars/token, English: ~4 chars/token
-        tokens = (hindi_chars // 2) + (other_chars // 4)
-        return max(tokens, 1)
-
-    @staticmethod
-    def check_rate_limit(current_count: int, limit: int, window: str = "minute") -> bool:
-        """Check if within rate limit"""
-        return current_count < limit
-
-
-class Logger:
-    """Structured logging helper"""
-
-    @staticmethod
-    def info(msg: str, extra: Optional[dict] = None):
-        if extra:
-            logger.info(f"{msg} | {extra}")
-        else:
-            logger.info(msg)
-
-    @staticmethod
-    def error(msg: str, error: Optional[Exception] = None):
-        if error:
-            logger.error(f"{msg} | Error: {str(error)}")
-        else:
-            logger.error(msg)
-
-    @staticmethod
-    def warning(msg: str):
-        logger.warning(msg)
-
-    @staticmethod
-    def debug(msg: str):
-        logger.debug(msg)
-
-
-# Export helpers
-text_cleaner = TextCleaner()
-token_counter = TokenCounter()
-log = Logger()
+# Safe API caller
+@retry_with_fallback(max_retries=2, backoff_factor=1.5)
+async def safe_api_call(func: Callable, *args, **kwargs) -> Any:
+    """Safely call an API function with retry and timeout"""
+    return await with_timeout(func(*args, **kwargs), timeout=10.0)
