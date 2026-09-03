@@ -1,169 +1,306 @@
 """
-Singh Ji Voice AI — Voice WebSocket Router
-Full-duplex WebSocket for telephony and live voice
+Singh Ji Voice AI — Telegram Bot Webhook Router
+Async TG Bot with background voice tasks
 """
 
-import json
+import os
 import asyncio
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 
-from core.connection_manager import manager
-from core.audio_streamer import audio_streamer
-from core.persona_matrix import persona_matrix
 from services.llm_service import llm_service
 from services.stt_service import stt_service
 from services.tts_manager import tts_manager
+from core.persona_matrix import persona_matrix
 from config import settings
 
 
-router = APIRouter(prefix="/ws/voice", tags=["voice-websocket"])
+router = APIRouter(prefix="/telegram", tags=["telegram"])
+
+# In-memory conversation store (replace with Redis/DB in production)
+user_sessions = {}
 
 
-@router.websocket("/{client_id}")
-async def voice_websocket(websocket: WebSocket, client_id: str):
+@router.post("/webhook")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Full-duplex WebSocket for real-time voice
-
-    Flow:
-    1. Client connects
-    2. Client sends audio chunks (Mu-Law/OGG)
-    3. Server transcribes → LLM → TTS → streams back audio
+    Telegram Bot Webhook
+    Handles: text messages, voice messages, commands
     """
-    connected = await manager.connect(websocket, client_id)
-    if not connected:
-        return
+    data = await request.json()
 
-    # Default persona
-    current_persona = "friendly_helper"
+    # Verify webhook secret
+    # (In production, verify X-Telegram-Bot-Api-Secret-Token header)
 
-    try:
-        # Send welcome message
-        persona = persona_matrix.get_persona(current_persona)
-        welcome_msg = {
-            "type": "greeting",
-            "text": persona.greeting if persona else "Hello! I am Singh Ji Voice AI.",
-            "persona": current_persona,
-            "voice": persona_matrix.get_voice_for_persona(current_persona)
+    if "message" not in data:
+        return JSONResponse({"status": "ok"})
+
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+
+    # Initialize user session
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "persona": "friendly_helper",
+            "language": "hi",
+            "history": []
         }
-        await manager.send_text(client_id, json.dumps(welcome_msg))
 
-        while True:
-            # Receive message from client
-            message = await websocket.receive()
+    session = user_sessions[user_id]
 
-            if "text" in message:
-                # Text command
-                data = json.loads(message["text"])
-                await handle_text_command(client_id, data, current_persona)
-
-            elif "bytes" in message:
-                # Audio data
-                audio_data = message["bytes"]
-                await handle_audio_input(client_id, audio_data, current_persona)
-
-    except WebSocketDisconnect:
-        manager.disconnect(client_id)
-    except Exception as e:
-        print(f"❌ WS Error for {client_id}: {e}")
-        manager.disconnect(client_id)
-
-
-async def handle_text_command(client_id: str, data: dict, persona_name: str):
-    """Handle text commands from client"""
-    command = data.get("command")
-
-    if command == "set_persona":
-        new_persona = data.get("persona", "friendly_helper")
-        persona = persona_matrix.get_persona(new_persona)
-        if persona:
-            response = {
-                "type": "persona_changed",
-                "persona": new_persona,
-                "greeting": persona.greeting
-            }
-            await manager.send_text(client_id, json.dumps(response))
-
-    elif command == "chat":
-        text = data.get("text", "")
-        await process_conversation(client_id, text, persona_name)
-
-    elif command == "ping":
-        await manager.send_text(client_id, json.dumps({"type": "pong"}))
-
-    elif command == "get_voices":
-        voices = tts_manager.get_voice_list()
-        response = {"type": "voices", "voices": voices}
-        await manager.send_text(client_id, json.dumps(response))
-
-
-async def handle_audio_input(client_id: str, audio_data: bytes, persona_name: str):
-    """Handle audio input: STT → LLM → TTS → Stream back"""
     try:
-        # Step 1: Convert audio format if needed
-        # Mu-Law 8k → PCM 16k
-        pcm_data = audio_streamer.mulaw_to_pcm(audio_data)
+        # Handle different message types
+        if "text" in message:
+            text = message["text"]
 
-        # Step 2: STT (Speech-to-Text)
-        transcript = await stt_service.transcribe(pcm_data, language="hi")
+            # Check for commands
+            if text.startswith("/"):
+                await handle_command(chat_id, text, session)
+            else:
+                # Regular text message
+                background_tasks.add_task(
+                    process_text_message,
+                    chat_id, text, session
+                )
 
-        # Send transcript to client
-        await manager.send_text(client_id, json.dumps({
-            "type": "transcript",
-            "text": transcript
-        }))
+        elif "voice" in message:
+            # Voice message
+            voice = message["voice"]
+            background_tasks.add_task(
+                process_voice_message,
+                chat_id, voice, session
+            )
 
-        # Step 3: Process with LLM
-        await process_conversation(client_id, transcript, persona_name)
+        elif "audio" in message:
+            # Audio file
+            audio = message["audio"]
+            background_tasks.add_task(
+                process_voice_message,
+                chat_id, audio, session
+            )
 
-    except Exception as e:
-        await manager.send_text(client_id, json.dumps({
-            "type": "error",
-            "message": f"Audio processing failed: {str(e)}"
-        }))
-
-
-async def process_conversation(client_id: str, text: str, persona_name: str):
-    """Full pipeline: LLM → TTS → Stream audio"""
-    try:
-        # Build system prompt with persona
-        system_prompt = persona_matrix.build_system_prompt(persona_name)
-
-        # Get LLM response
-        response_text = await llm_service.generate(
-            prompt=text,
-            system_prompt=system_prompt
-        )
-
-        # Send text response
-        await manager.send_text(client_id, json.dumps({
-            "type": "response",
-            "text": response_text
-        }))
-
-        # Get voice for persona
-        voice_id = persona_matrix.get_voice_for_persona(persona_name)
-
-        # Stream TTS audio back
-        await manager.send_text(client_id, json.dumps({
-            "type": "audio_start",
-            "voice": voice_id
-        }))
-
-        async for chunk in tts_manager.synthesize_stream(response_text, voice=voice_id):
-            await manager.send_bytes(client_id, chunk)
-
-        await manager.send_text(client_id, json.dumps({
-            "type": "audio_end"
-        }))
+        return JSONResponse({"status": "ok"})
 
     except Exception as e:
-        await manager.send_text(client_id, json.dumps({
-            "type": "error",
-            "message": f"Conversation failed: {str(e)}"
-        }))
+        print(f"❌ Telegram webhook error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+async def handle_command(chat_id: int, command: str, session: dict):
+    """Handle Telegram bot commands"""
+    from httpx import AsyncClient
+
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    api_url = f"https://api.telegram.org/bot{bot_token}"
+
+    async with AsyncClient() as client:
+        if command == "/start":
+            persona = persona_matrix.get_persona(session["persona"])
+            greeting = persona.greeting if persona else "Namaste! Main Singh Ji hoon."
+
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"{greeting}\n\nCommands:\n/persona — Change persona\n/voices — List voices\n/help — Help"
+            })
+
+        elif command == "/help":
+            help_text = """🎙️ Singh Ji Voice AI — Commands:
+
+/persona — Change voice persona
+/voices — List available voices
+/language — Change language
+/reset — Reset conversation
+/help — Show this help
+
+Just send voice or text to chat!"""
+
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": help_text
+            })
+
+        elif command == "/persona":
+            personas = persona_matrix.list_personas()
+            text = "🎭 Choose persona:\n"
+            for p in personas:
+                text += f"\n• {p['id']} — {p['name']} ({p['language']})"
+
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": text
+            })
+
+        elif command == "/voices":
+            voices = tts_manager.get_voice_list()
+            text = "🎙️ Available voices:\n"
+            for vid, v in list(voices.items())[:10]:
+                text += f"\n• {vid} — {v['name']} ({v['gender']})"
+            text += "\n\n...and more!"
+
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": text
+            })
+
+        elif command == "/reset":
+            session["history"] = []
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "🔄 Conversation reset!"
+            })
+
+        else:
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "Unknown command. Use /help for list."
+            })
+
+
+async def process_text_message(chat_id: int, text: str, session: dict):
+    """Process text message: LLM → TTS → Send voice"""
+    from httpx import AsyncClient
+
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    api_url = f"https://api.telegram.org/bot{bot_token}"
+
+    async with AsyncClient() as client:
+        try:
+            # Send "typing" action
+            await client.post(f"{api_url}/sendChatAction", json={
+                "chat_id": chat_id,
+                "action": "typing"
+            })
+
+            # Build system prompt
+            system_prompt = persona_matrix.build_system_prompt(session["persona"])
+
+            # Generate response
+            response_text = await llm_service.generate(
+                prompt=text,
+                system_prompt=system_prompt
+            )
+
+            # Send text response
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": response_text
+            })
+
+            # Generate voice response
+            voice_id = persona_matrix.get_voice_for_persona(session["persona"])
+            ogg_path = await tts_manager.synthesize_telegram(
+                response_text,
+                voice=voice_id,
+                language=session["language"]
+            )
+
+            # Send voice
+            with open(ogg_path, "rb") as voice_file:
+                await client.post(
+                    f"{api_url}/sendVoice",
+                    data={"chat_id": chat_id},
+                    files={"voice": ("voice.ogg", voice_file, "audio/ogg")}
+                )
+
+            # Clean up
+            if os.path.exists(ogg_path):
+                os.remove(ogg_path)
+
+            # Store in history
+            session["history"].append({"user": text, "ai": response_text})
+
+        except Exception as e:
+            print(f"❌ Text processing error: {e}")
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"Sorry, error occurred: {str(e)}"
+            })
+
+
+async def process_voice_message(chat_id: int, voice: dict, session: dict):
+    """Process voice message: Download → STT → LLM → TTS → Send"""
+    from httpx import AsyncClient
+
+    bot_token = settings.TELEGRAM_BOT_TOKEN
+    api_url = f"https://api.telegram.org/bot{bot_token}"
+
+    async with AsyncClient() as client:
+        try:
+            # Send "typing" action
+            await client.post(f"{api_url}/sendChatAction", json={
+                "chat_id": chat_id,
+                "action": "typing"
+            })
+
+            # Get voice file
+            file_id = voice["file_id"]
+            file_info = await client.get(f"{api_url}/getFile?file_id={file_id}")
+            file_path = file_info.json()["result"]["file_path"]
+
+            # Download voice
+            file_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+            voice_response = await client.get(file_url)
+            voice_data = voice_response.content
+
+            # STT
+            transcript = await stt_service.transcribe(voice_data, language=session["language"])
+
+            # Send transcript
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"🎤 You said: {transcript}"
+            })
+
+            # Process with LLM
+            system_prompt = persona_matrix.build_system_prompt(session["persona"])
+            response_text = await llm_service.generate(
+                prompt=transcript,
+                system_prompt=system_prompt
+            )
+
+            # Send text
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": response_text
+            })
+
+            # Generate voice
+            voice_id = persona_matrix.get_voice_for_persona(session["persona"])
+            ogg_path = await tts_manager.synthesize_telegram(
+                response_text,
+                voice=voice_id,
+                language=session["language"]
+            )
+
+            # Send voice
+            with open(ogg_path, "rb") as voice_file:
+                await client.post(
+                    f"{api_url}/sendVoice",
+                    data={"chat_id": chat_id},
+                    files={"voice": ("voice.ogg", voice_file, "audio/ogg")}
+                )
+
+            # Clean up
+            if os.path.exists(ogg_path):
+                os.remove(ogg_path)
+
+            # Store history
+            session["history"].append({"user": transcript, "ai": response_text})
+
+        except Exception as e:
+            print(f"❌ Voice processing error: {e}")
+            await client.post(f"{api_url}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": f"Sorry, could not process voice: {str(e)}"
+            })
 
 
 @router.get("/stats")
-async def websocket_stats():
-    """Get WebSocket connection statistics"""
-    return manager.get_stats()
+async def telegram_stats():
+    """Get Telegram bot statistics"""
+    return {
+        "active_users": len(user_sessions),
+        "users": list(user_sessions.keys()),
+        "total_conversations": sum(len(s["history"]) for s in user_sessions.values())
+    }
